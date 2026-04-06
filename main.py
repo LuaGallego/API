@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 
 from datetime import datetime
 from typing import Any
@@ -7,7 +8,7 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from config import settings
-from providers.actions_writer import append_action_queue
+from providers.rcon_sender import send_rcon_command
 from providers.link_results_writer import append_link_result_queue
 from providers.logs_reader import list_available_log_dates, list_logs_by_date
 from providers.players_reader import get_players_online
@@ -59,7 +60,7 @@ def require_api_key(x_api_key: str | None):
 
 
 @app.post("/actions/redeem")
-def actions_redeem(body: RedeemActionBody, x_api_key: str | None = Header(default=None)):
+async def actions_redeem(body: RedeemActionBody, x_api_key: str | None = Header(default=None)):
     require_api_key(x_api_key)
 
     redeem_type = str(body.redeem_type or "").strip().lower()
@@ -74,23 +75,16 @@ def actions_redeem(body: RedeemActionBody, x_api_key: str | None = Header(defaul
             "time": datetime.now().isoformat(),
         }
 
+    # Lógica para Resgate de ITEM
     if redeem_type == "item":
         item_id = str(body.payload.get("item_id") or "").strip()
 
-        try:
-            quantity = int(body.payload.get("quantity") or 1)
-        except Exception:
-            quantity = 1
-
-        if quantity <= 0:
-            quantity = 1
-
-        if not body.steam_id:
+        if not body.username:
             return {
                 "ok": False,
                 "status": "failed",
                 "request_id": request_id,
-                "message": "steam_id ausente",
+                "message": "username ausente",
                 "time": datetime.now().isoformat(),
             }
 
@@ -103,19 +97,9 @@ def actions_redeem(body: RedeemActionBody, x_api_key: str | None = Header(defaul
                 "time": datetime.now().isoformat(),
             }
 
-        result = append_action_queue(
-            {
-                "request_id": request_id,
-                "action": "give_item",
-                "discord_id": body.discord_id,
-                "steam_id": body.steam_id,
-                "username": body.username or "",
-                "redeem_type": redeem_type,
-                "item_id": item_id,
-                "quantity": quantity,
-                "payload": body.payload,
-            }
-        )
+        # Comando nativo do Zomboid: additem "username" "module.item"
+        comando_rcon = f'additem "{body.username}" "{item_id}"'
+        result = await send_rcon_command(comando_rcon)
 
         return {
             "ok": result.get("ok", False),
@@ -124,7 +108,45 @@ def actions_redeem(body: RedeemActionBody, x_api_key: str | None = Header(defaul
             "redeem_type": redeem_type,
             "steam_id": body.steam_id,
             "username": body.username or "",
-            "message": "Ação enviada para a fila do servidor",
+            "message": "Ação de item executada via RCON",
+            "result": result,
+            "time": datetime.now().isoformat(),
+        }
+
+    # Lógica para Resgate de VEÍCULO
+    elif redeem_type == "veiculo":
+        item_id = str(body.payload.get("item_id") or "").strip()
+
+        if not body.username:
+            return {
+                "ok": False,
+                "status": "failed",
+                "request_id": request_id,
+                "message": "username ausente",
+                "time": datetime.now().isoformat(),
+            }
+
+        if not item_id:
+            return {
+                "ok": False,
+                "status": "failed",
+                "request_id": request_id,
+                "message": "item_id (id do veículo) ausente",
+                "time": datetime.now().isoformat(),
+            }
+
+        # Comando nativo do Zomboid: addvehicle "username" "vehiclename"
+        comando_rcon = f'addvehicle "{body.username}" "{item_id}"'
+        result = await send_rcon_command(comando_rcon)
+
+        return {
+            "ok": result.get("ok", False),
+            "status": result.get("status", "failed"),
+            "request_id": request_id,
+            "redeem_type": redeem_type,
+            "steam_id": body.steam_id,
+            "username": body.username or "",
+            "message": "Ação de veículo executada via RCON",
             "result": result,
             "time": datetime.now().isoformat(),
         }
@@ -133,7 +155,7 @@ def actions_redeem(body: RedeemActionBody, x_api_key: str | None = Header(defaul
         "ok": False,
         "status": "failed",
         "request_id": request_id,
-        "message": f"redeem_type não suportado ainda: {body.redeem_type}",
+        "message": f"redeem_type não suportado ainda: {redeem_type}",
         "time": datetime.now().isoformat(),
     }
 
@@ -158,10 +180,23 @@ def link_result(body: LinkResultBody, x_api_key: str | None = Header(default=Non
         }
     )
 
+    # Inserção no arquivo de texto para o Mod Lua ler (Inbox)
+    username = body.username or ""
+    linked_str = "1" if body.linked else "0"
+    message = str(body.message or "").replace("\n", " ")
+
+    inbox_path = os.path.join(settings.LUA_DIR, "doomtelemetry_inbox.txt")
+
+    try:
+        with open(inbox_path, "a", encoding="utf-8") as f:
+            f.write(f"{username}|{linked_str}|{message}\n")
+    except Exception as e:
+        print(f"[ERRO INBOX] Falha ao escrever no arquivo txt: {e}")
+
     return {
         "ok": result.get("ok", False),
         "status": result.get("status", "failed"),
-        "message": "Resultado de vínculo enviado para a fila do servidor",
+        "message": "Resultado de vínculo enviado para a fila do servidor e Inbox",
         "result": result,
         "time": datetime.now().isoformat(),
     }
